@@ -398,122 +398,124 @@ def train_span_extraction(
     few_shot=False,
     k_shot=2
 ):
+    # Build datasets
     if few_shot:
-        few_shot_train = create_few_shot_data(train_data, k=k_shot)
-        # (You can also apply few-shot sampling to val_data if your val set is large.)
-        
-        # ====== BUILD DATASETS ====== #
-        train_dataset = SpanExtractionChunkedDataset(few_shot_train, tokenizer)
-        val_dataset   = SpanExtractionChunkedDataset(val_data, tokenizer)
+        few = create_few_shot_data(train_data, k=k_shot)
+        train_dataset = SpanExtractionChunkedDataset(few)
+        val_dataset   = SpanExtractionChunkedDataset(val_data)
     else:
-        train_dataset = SpanExtractionChunkedDataset(train_data, tokenizer)
-        val_dataset   = SpanExtractionChunkedDataset(val_data, tokenizer)
+        train_dataset = SpanExtractionChunkedDataset(train_data)
+        val_dataset   = SpanExtractionChunkedDataset(val_data)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=span_collate_fn)
-    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=span_collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  collate_fn=span_collate_fn)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, collate_fn=span_collate_fn)
 
-    model = FrozenGNNBertSpanModel(base_model_name=base_model_name, freeze=freeze, lora_enabled=lora_enabled).to(device)
+    do_validation = len(val_dataset) > 0
 
-    # We only optimize the span head
+    # Model & optimizer
+    model = FrozenGNNBertSpanModel(
+        base_model_name=base_model_name,
+        freeze=freeze,
+        lora_enabled=lora_enabled
+    ).to(device)
     optimizer = torch.optim.AdamW(model.span_head.parameters(), lr=lr)
-
-    ce_loss = nn.CrossEntropyLoss()
-    bce_loss = nn.BCEWithLogitsLoss()
+    ce_loss   = nn.CrossEntropyLoss()
+    bce_loss  = nn.BCEWithLogitsLoss()
 
     epoch_loss_train = []
-    epoch_loss_val = []
-    best_val_loss = 10000000
-    best_epoch = -1
+    epoch_loss_val   = []
+    best_val_loss    = float('inf')
+    best_epoch       = -1
 
-    for epoch in range(epochs):
+    for epoch in range(1, epochs+1):
+        # — train —
         model.train()
         train_losses = []
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1} - Training"):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} — Training"):
             optimizer.zero_grad()
-            input_ids = batch["input_ids"].to(device)
+
+            input_ids      = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            start_label = batch["start_label"].to(device)
-            end_label   = batch["end_label"].to(device)
-            no_span_label = batch["no_span_label"].float().to(device)  # BCE => float
+            start_pos      = batch["start_positions"].to(device)
+            end_pos        = batch["end_positions"].to(device)
+            no_span_label  = batch["no_span_label"].float().to(device)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            start_logits = outputs["start_logits"]  # [B, L]
-            end_logits   = outputs["end_logits"]    # [B, L]
-            no_span_logit = outputs["no_span_logit"]  # [B]
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+            start_logits, end_logits, no_span_logit = out["start_logits"], out["end_logits"], out["no_span_logit"]
 
-            # Only compute start/end losses where no_span_label == 0
-            valid_mask = (start_label >= 0) & (end_label >= 0) & (no_span_label == 0)
-            if valid_mask.any():
-                start_ce = ce_loss(start_logits[valid_mask], start_label[valid_mask])
-                end_ce   = ce_loss(end_logits[valid_mask], end_label[valid_mask])
+            # only compute span losses where no_span==0
+            valid = (start_pos >= 0) & (end_pos >= 0) & (no_span_label == 0)
+            if valid.any():
+                loss_start = ce_loss(start_logits[valid], start_pos[valid])
+                loss_end   = ce_loss(end_logits[valid],   end_pos[valid])
             else:
-                start_ce = torch.tensor(0.0, device=device)
-                end_ce   = torch.tensor(0.0, device=device)
+                loss_start = torch.tensor(0.0, device=device)
+                loss_end   = torch.tensor(0.0, device=device)
 
-            # "no span" => BCE
-            no_span_bce = bce_loss(no_span_logit, no_span_label)
+            loss_nospan = bce_loss(no_span_logit, no_span_label)
+            loss = loss_start + loss_end + loss_nospan
 
-            loss = start_ce + end_ce + no_span_bce
             loss.backward()
             optimizer.step()
             train_losses.append(loss.item())
 
-        print(f"Epoch {epoch+1} - Train Loss: {np.mean(train_losses):.4f}")
-        epoch_loss_train.append(np.mean(train_losses))
+        avg_train = float(np.mean(train_losses))
+        epoch_loss_train.append(avg_train)
+        print(f"Epoch {epoch} — Train Loss: {avg_train:.4f}")
 
-        # Validation
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                start_label = batch["start_label"].to(device)
-                end_label   = batch["end_label"].to(device)
-                no_span_label = batch["no_span_label"].float().to(device)
+        # — validate —
+        if do_validation:
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    input_ids      = batch["input_ids"].to(device)
+                    attention_mask = batch["attention_mask"].to(device)
+                    start_pos      = batch["start_positions"].to(device)
+                    end_pos        = batch["end_positions"].to(device)
+                    no_span_label  = batch["no_span_label"].float().to(device)
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                start_logits = outputs["start_logits"]
-                end_logits   = outputs["end_logits"]
-                no_span_logit = outputs["no_span_logit"]
+                    out = model(input_ids=input_ids, attention_mask=attention_mask)
+                    start_logits, end_logits, no_span_logit = out["start_logits"], out["end_logits"], out["no_span_logit"]
 
-                valid_mask = (start_label >= 0) & (end_label >= 0) & (no_span_label == 0)
-                if valid_mask.any():
-                    start_ce = ce_loss(start_logits[valid_mask], start_label[valid_mask])
-                    end_ce   = ce_loss(end_logits[valid_mask], end_label[valid_mask])
-                else:
-                    start_ce = torch.tensor(0.0, device=device)
-                    end_ce   = torch.tensor(0.0, device=device)
+                    valid = (start_pos >= 0) & (end_pos >= 0) & (no_span_label == 0)
+                    if valid.any():
+                        loss_start = ce_loss(start_logits[valid], start_pos[valid])
+                        loss_end   = ce_loss(end_logits[valid],   end_pos[valid])
+                    else:
+                        loss_start = torch.tensor(0.0, device=device)
+                        loss_end   = torch.tensor(0.0, device=device)
+                    loss_nospan = bce_loss(no_span_logit, no_span_label)
 
-                no_span_bce = bce_loss(no_span_logit, no_span_label)
-                loss = start_ce + end_ce + no_span_bce
-                val_losses.append(loss.item())
+                    val_losses.append((loss_start + loss_end + loss_nospan).item())
 
-        if len(val_losses) > 0:
-            print(f"Epoch {epoch+1} - Val Loss: {np.mean(val_losses):.4f}")
-            epoch_loss_val.append(np.mean(val_losses))
+            avg_val = float(np.mean(val_losses)) if val_losses else float('inf')
+            epoch_loss_val.append(avg_val)
+            print(f"Epoch {epoch} — Val   Loss: {avg_val:.4f}")
+
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                best_epoch    = epoch
+                if save_model:
+                    torch.save(model.state_dict(), save_path)
         else:
-            print(f"Epoch {epoch+1} - Val Loss: (no samples)")
+            print(f"Epoch {epoch} — no validation data, skipping.")
 
-        if np.mean(val_losses) < best_val_loss:
-            best_val_loss = np.mean(val_losses)
-            best_epoch = epoch+1
-            if save_model:
-                torch.save(model.state_dict(), save_path)
+    print(f"\nTraining complete. Best val loss {best_val_loss:.4f} at epoch {best_epoch}.")
 
-    print("Training complete.")
-    print(f"Best performance achieved at Epoch:{best_epoch}")
-
-    if show_graph:
-        plt.plot(range(len(epoch_loss_train)), epoch_loss_train, label='Train Loss', marker='o')
-        plt.plot(range(len(epoch_loss_val)), epoch_loss_val, label='Validation Loss', marker='o')
-        plt.title('Loss Plot')
-        plt.xlabel('Epochs -->')
-        plt.ylabel('Loss -->')
+    if show_graph and do_validation:
+        plt.plot(epoch_loss_train, label="Train Loss", marker='o')
+        plt.plot(epoch_loss_val,   label="Val   Loss", marker='o')
+        plt.title("Span‐Extraction Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
         plt.legend()
+        plt.tight_layout()
         plt.show()
-        plt.savefig('Fine-tuning_loss.png')
+        plt.savefig("span_extraction_loss.png")
+
     return model
+
 
 def create_few_shot_data(full_data, k=5, random_seed=42):
     random.seed(random_seed)
@@ -722,7 +724,7 @@ def extract_sentences_by_intent(
         for cust_line in customer_lines:
             for sent in nlp(cust_line).sents:
                 s = sent.text.strip()
-                if s:
+                if s and len(s.split(' '))>6:
                     sentences.append(s)
 
     else:
@@ -737,7 +739,7 @@ def extract_sentences_by_intent(
         for cust_line in customer_lines:
             for sent in nlp(cust_line).sents:
                 s = sent.text.strip()
-                if s:
+                if s and len(s.split(' '))>6:
                     sentences.append(s)
 
     # 2) Load base BERT + wrap in same LoRA config

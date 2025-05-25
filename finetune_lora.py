@@ -21,7 +21,7 @@ MODEL_NAME = "bert-base-uncased"
 BATCH_SIZE = 16
 MAX_LENGTH = 128
 LEARNING_RATE = 5e-4
-EPOCHS = 50
+EPOCHS = 20
 SEED = 42
 ADAPTER_SAVE_DIR = "./lora_finance_adapter"
 CHECKPOINT_PATH = os.path.join(ADAPTER_SAVE_DIR, "training_checkpoint.pt")
@@ -148,7 +148,7 @@ def fine_tune_lora(dataset_name: str = "FinGPT/fingpt-fiqa_qa", split: str = "tr
         torch.save(ckpt, CHECKPOINT_PATH)
 
     # Final plots
-    fig, axes = plt.subplots(3, 1, figsize=(8, 12), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(6, 10), sharex=True)
     epochs_list = list(range(1, len(epoch_losses) + 1))
     axes[0].plot(epochs_list, epoch_losses, marker='o'); axes[0].set_ylabel('Loss'); axes[0].set_title('Training Loss'); axes[0].grid(True)
     axes[1].plot(epochs_list, epoch_ppls, marker='o'); axes[1].set_ylabel('Perplexity'); axes[1].set_title('Training Perplexity'); axes[1].grid(True)

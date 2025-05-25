@@ -1,4 +1,5 @@
 import torch
+import os
 import torch.nn as nn
 import torch.nn.functional as F
 from peft import PeftModel, LoraConfig, get_peft_model
@@ -274,144 +275,82 @@ class SpanExtractionHead(nn.Module):
 
 class FrozenGNNBertSpanModel(nn.Module):
     """
-    Wraps the GNN-augmented BERT, freezes its parameters, 
+    Wraps the GNN-augmented BERT, freezes its parameters,
     and adds a span-extraction head on top.
     """
-    def __init__(self, base_model_name="bert-base-uncased", hidden_dim=768, gnn_dim=128, freeze=True, lora_enabled=False):
+    def __init__(
+        self,
+        base_model_name: str = "bert-base-uncased",
+        hidden_dim: int = 768,
+        gnn_dim: int = 128,
+        freeze: bool = True,
+        lora_enabled: bool = False,
+        gnn_ckpt_path: str = "gnn_model_checkpoint.pt",
+    ):
         super().__init__()
-        self.gnn_bert = GraphAugmentedNLIModel(
-            base_model_name=base_model_name
-        )
+        # (1) build the same GNN-BERT backbone
+        self.gnn_bert = GraphAugmentedNLIModel(base_model_name=base_model_name)
+
+        # (2) if requested, load & freeze its weights
         if freeze:
-            self.gnn_bert.load_state_dict(torch.load('gnn_model_weights_2.pt', weights_only=True))
-            
+            ckpt = torch.load(gnn_ckpt_path, map_location=DEVICE)
+            # pull out only the model_state_dict if present
+            state = ckpt.get("model_state_dict", ckpt)
+            # we allow mismatches (e.g. optimizer keys) by strict=False
+            self.gnn_bert.load_state_dict(state, strict=False)
+            # freeze all backbone params
+            for p in self.gnn_bert.parameters():
+                p.requires_grad = False
+
+        # (3) if you also want a LoRA adapter on the backbone:
         if lora_enabled:
-            lora_config = LoraConfig(
+            lora_cfg = LoraConfig(
                 r=8,
                 lora_alpha=32,
                 lora_dropout=0.1,
                 bias="none",
                 task_type="SEQ_CLS",
-                target_modules=['query', 'value']
+                target_modules=["query", "value"],
             )
-            
-            # Wrap the model with LoRA again
-            self.gnn_bert = get_peft_model(self.gnn_bert, lora_config)
-            # Load the previously saved LoRA weights
-            self.gnn_bert.load_adapter("./lora_finance_adapter", adapter_name="default")
-            
-            # Set LoRA adapter as active if needed (for PeftModel, it's usually active by default)
+            self.gnn_bert = get_peft_model(self.gnn_bert, lora_cfg)
+            # assume your adapter .pt is in lora_finance_adapter/training_checkpoint.pt
+            adapter_ckpt = torch.load(
+                os.path.join("lora_finance_adapter", "training_checkpoint.pt"),
+                map_location=DEVICE,
+            )
+            self.gnn_bert.load_state_dict(adapter_ckpt.get("model_state_dict", adapter_ckpt), strict=False)
             self.gnn_bert.set_adapter("default")
-        # Freeze all params in GNN-BERT
-        if freeze:
-            for param in self.gnn_bert.parameters():
-                param.requires_grad = False
+            # freeze base again, leave LoRA tunables on
+            for name, p in self.gnn_bert.named_parameters():
+                if "lora_" not in name:
+                    p.requires_grad = False
 
-        # New trainable head
+        # (4) finally our new span-prediction head
         self.span_head = SpanExtractionHead(hidden_dim=hidden_dim)
 
     def forward(
-        self, 
-        input_ids, 
+        self,
+        input_ids,
         attention_mask,
-        premise_graph_tokens=None,    
+        premise_graph_tokens=None,
         premise_graph_edges=None,
         premise_node_indices=None,
         hypothesis_graph_tokens=None,
         hypothesis_graph_edges=None,
-        hypothesis_node_indices=None
+        hypothesis_node_indices=None,
     ):
+        # get frozen backbone outputs
         with torch.no_grad():
-            # We'll just get the last hidden states from BERT
-            outputs = self.gnn_bert.bert(input_ids=input_ids, attention_mask=attention_mask)
-            # shape: [batch_size, seq_len, hidden_dim]
-            hidden_states = outputs.last_hidden_state
+            bert_out = self.gnn_bert.bert(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            hidden_states = bert_out.last_hidden_state  # [B, T, H]
 
-        # Now feed to the trainable span head
+        # span‐head on top
         start_logits, end_logits, no_span_logit = self.span_head(hidden_states, attention_mask)
         return {
-            "start_logits": start_logits, 
-            "end_logits": end_logits,
-            "no_span_logit": no_span_logit
+            "start_logits": start_logits,
+            "end_logits":   end_logits,
+            "no_span_logit": no_span_logit,
         }
-
-class SparseGNN(nn.Module):
-    """
-    Simple multi-layer GNN using sparse adjacency for efficiency.
-    Expects `edge_index` of shape [2, E] and node features `h` of shape [N, D].
-    """
-    def __init__(self, in_dim, hidden_dim, out_dim, num_layers=2, activation=nn.ReLU):
-        super().__init__()
-        self.num_layers = num_layers
-        self.linears = nn.ModuleList()
-        # first layer
-        self.linears.append(nn.Linear(in_dim, hidden_dim))
-        # hidden layers
-        for _ in range(num_layers - 2):
-            self.linears.append(nn.Linear(hidden_dim, hidden_dim))
-        # output layer
-        self.linears.append(nn.Linear(hidden_dim, out_dim))
-        self.act = activation()
-
-    def forward(self, h, edge_index):
-        # h: [N, D]
-        # edge_index: [2, E]
-        N = h.size(0)
-        E = edge_index.size(1)
-        device = h.device
-        # Create sparse adjacency with self-loops
-        # Add self-loop edges
-        self_loop = torch.arange(0, N, dtype=edge_index.dtype, device=device)
-        self_loop = self_loop.unsqueeze(0).repeat(2, 1)
-        full_index = torch.cat([edge_index, self_loop], dim=1)
-        values = torch.ones(full_index.size(1), device=device)
-        adj = torch.sparse_coo_tensor(full_index, values, (N, N))
-        # message passing through layers
-        x = h
-        for lin in self.linears:
-            # aggregate: sparse matrix multiplication
-            x = torch.sparse.mm(adj, x)
-            x = lin(x)
-            x = self.act(x)
-        return x
-
-class FinExBERT(nn.Module):
-    """
-    Fin-ExBERT: BERT encoder + SparseGNN + span-prediction head
-    """
-    def __init__(self, bert_model, gnn_in, gnn_hidden, gnn_out, head_dim, num_gnn_layers=2):
-        super().__init__()
-        self.bert = bert_model
-        # freeze BERT during GNN forward if desired
-        # for param in self.bert.parameters():
-        #     param.requires_grad = False
-
-        # GNN module
-        self.gnn = SparseGNN(gnn_in, gnn_hidden, gnn_out, num_layers=num_gnn_layers)
-        # span-prediction head
-        self.start_head = nn.Linear(gnn_out, head_dim)
-        self.end_head = nn.Linear(gnn_out, head_dim)
-
-    def forward(self, input_ids, attention_mask, edge_index):
-        # BERT encoding
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state  # [B, T, H]
-        batch_size, seq_len, hidden_size = hidden_states.size()
-        # reshape for GNN: flatten batch and tokens
-        x = hidden_states.view(batch_size * seq_len, hidden_size)
-
-        # Use same edge_index for each sequence: shift indices per batch
-        all_x = []
-        for b in range(batch_size):
-            # offset edge indices by b * seq_len
-            idx_shift = b * seq_len
-            ei = edge_index + idx_shift
-            x_b = x[b * seq_len:(b + 1) * seq_len]
-            gnn_out = self.gnn(x_b, ei)
-            all_x.append(gnn_out)
-        gnn_feat = torch.stack(all_x, dim=0)  # [B, T, gnn_out]
-
-        # span-prediction logits
-        start_logits = self.start_head(gnn_feat)  # [B, T, head_dim]
-        end_logits   = self.end_head(gnn_feat)
-        return start_logits, end_logits
