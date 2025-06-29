@@ -1,9 +1,11 @@
 import torch
 import os
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 from peft import PeftModel, LoraConfig, get_peft_model
 from transformers import AutoTokenizer, AutoModel, AutoConfig, get_linear_schedule_with_warmup
+from torch.nn import MultiheadAttention, GELU
 
 MODEL_NAME = "bert-base-uncased"
 BATCH_SIZE = 16
@@ -184,173 +186,66 @@ class GraphAugmentedFinNLIModel(nn.Module):
             loss = loss_fn(logits, labels)
         return {"loss": loss, "logits": logits}
 
-'''
-class SpanExtractionHead(nn.Module):
-    """
-    Predicts start index, end index, and a 'no span' logit from
-    the final hidden states of the encoder (e.g., GNN-BERT).
-    """
-    def __init__(self, hidden_dim=1024, dropout=0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        self.start_classifier = nn.Linear(hidden_dim, 1)
-        self.end_classifier   = nn.Linear(hidden_dim, 1)
-        self.no_span_classifier = nn.Linear(hidden_dim, 1)
 
-    def forward(self, hidden_states, attention_mask=None):
-        hidden_states = self.dropout(hidden_states)  # [batch_size, seq_len, hidden_dim]
-        start_logits = self.start_classifier(hidden_states).squeeze(-1)  # [batch_size, seq_len]
-        end_logits   = self.end_classifier(hidden_states).squeeze(-1)    # [batch_size, seq_len]
-
-        # For 'no span' detection, we use the [CLS] token embedding
-        cls_hidden = hidden_states[:, 0, :]  # shape [batch_size, hidden_dim]
-        no_span_logit = self.no_span_classifier(cls_hidden).squeeze(-1)  # [batch_size]
-
-        # If attention_mask is provided, mask out invalid positions
-        if attention_mask is not None:
-            start_logits = start_logits.masked_fill(attention_mask == 0, -1e4)
-            end_logits   = end_logits.masked_fill(attention_mask == 0, -1e4)
-
-        return start_logits, end_logits, no_span_logit
-'''
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
- 
-class SpanExtractionHead(nn.Module):
-    """
-    Deeper version that includes multiple linear+ReLU layers
-    before producing start/end/no_span logits.
-    """
-    def __init__(self, hidden_dim=1024, dropout=0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        
-        # A small feedforward "projection" stack,
-        # which preserves the [batch, seq_len, hidden_dim] shape.
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim*2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim*2, hidden_dim),
-            nn.ReLU(),
-        )
-        
-        # Final classifiers
-        self.start_classifier = nn.Linear(hidden_dim, 1)      # -> [batch, seq_len, 1]
-        self.end_classifier   = nn.Linear(hidden_dim, 1)      # -> [batch, seq_len, 1]
-        self.no_span_classifier = nn.Linear(hidden_dim, 1)    # -> [batch, 1]
- 
-    def forward(self, hidden_states, attention_mask=None):
-        """
-        hidden_states: [batch_size, seq_len, hidden_dim]
-        attention_mask: optional [batch_size, seq_len]
-        
-        Returns:
-          start_logits: [batch_size, seq_len]
-          end_logits:   [batch_size, seq_len]
-          no_span_logit: [batch_size]
-        """
-        # (1) Dropout on input
-        x = self.dropout(hidden_states)
-        
-        # (2) Pass through the MLP, shape remains [batch, seq_len, hidden_dim]
-        x = self.mlp(x)  
-        
-        # (3) Compute start/end logits for each token
-        start_logits = self.start_classifier(x).squeeze(-1)  # [batch_size, seq_len]
-        end_logits   = self.end_classifier(x).squeeze(-1)    # [batch_size, seq_len]
-        
-        # (4) Compute "no span" from the [CLS] hidden state (token index = 0)
-        cls_hidden = x[:, 0, :]            # [batch_size, hidden_dim]
-        no_span_logit = self.no_span_classifier(cls_hidden).squeeze(-1)  # [batch_size]
-        
-        # (5) Optional: mask out invalid tokens
-        if attention_mask is not None:
-            start_logits = start_logits.masked_fill(attention_mask == 0, -1e4)
-            end_logits   = end_logits.masked_fill(attention_mask == 0, -1e4)
-        
-        return start_logits, end_logits, no_span_logit
-
-class FrozenGNNBertSpanModel(nn.Module):
-    """
-    Wraps the GNN-augmented BERT, freezes its parameters,
-    and adds a span-extraction head on top.
-    """
-    def __init__(
-        self,
-        base_model_name: str = "bert-base-uncased",
-        hidden_dim: int = 768,
-        gnn_dim: int = 128,
-        freeze: bool = True,
-        lora_enabled: bool = False,
-        gnn_ckpt_path: str = "gnn_model_checkpoint.pt",
+class SentenceExtractionModel(nn.Module):
+    def __init__(self,
+                 base_model_name: str,
+                 dropout_prob: float = 0.1,
+                 adapter_dir: str = "./lora_finance_adapter",
+                 backbone: str = 'default',
+                 init_pos_frac: float = None    # NEW!
     ):
+        """
+        backbone:
+          - 'default' → plain AutoModel.from_pretrained(base_model_name)
+          - 'finexbert' → use the .bert submodule of your GraphAugmentedFinNLIModel
+        """
         super().__init__()
-        # (1) build the same GNN-BERT backbone
-        self.gnn_bert = GraphAugmentedNLIModel(base_model_name=base_model_name)
 
-        # (2) if requested, load & freeze its weights
-        if freeze:
-            ckpt = torch.load(gnn_ckpt_path, map_location=DEVICE)
-            # pull out only the model_state_dict if present
-            state = ckpt.get("model_state_dict", ckpt)
-            # we allow mismatches (e.g. optimizer keys) by strict=False
-            self.gnn_bert.load_state_dict(state, strict=False)
-            # freeze all backbone params
-            for p in self.gnn_bert.parameters():
-                p.requires_grad = False
+        # load config
+        config = AutoConfig.from_pretrained(base_model_name)
 
-        # (3) if you also want a LoRA adapter on the backbone:
-        if lora_enabled:
+        if backbone == 'default':
+            # plain BERT
+            self.bert = AutoModel.from_pretrained(base_model_name, config=config)
+
+        elif backbone == 'finexbert':
+            # instantiate your full FinNLI model, then grab its .bert
+            base_model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
             lora_cfg = LoraConfig(
                 r=8,
                 lora_alpha=32,
                 lora_dropout=0.1,
                 bias="none",
-                task_type="SEQ_CLS",
-                target_modules=["query", "value"],
+                task_type="SEQ_CLS"#"CAUSAL_LM",  # must match your fine-tune setting
             )
-            self.gnn_bert = get_peft_model(self.gnn_bert, lora_cfg)
-            # assume your adapter .pt is in lora_finance_adapter/training_checkpoint.pt
-            adapter_ckpt = torch.load(
-                os.path.join("lora_finance_adapter", "training_checkpoint.pt"),
-                map_location=DEVICE,
-            )
-            self.gnn_bert.load_state_dict(adapter_ckpt.get("model_state_dict", adapter_ckpt), strict=False)
-            self.gnn_bert.set_adapter("default")
-            # freeze base again, leave LoRA tunables on
-            for name, p in self.gnn_bert.named_parameters():
-                if "lora_" not in name:
-                    p.requires_grad = False
+            full = get_peft_model(base_model, lora_cfg).to(DEVICE)
+            chkpt_path = os.path.join(adapter_dir, "training_checkpoint.pt")
+            if not os.path.isfile(chkpt_path):
+                raise FileNotFoundError(f"No LoRA checkpoint at {chkpt_path}")
+            ckpt = torch.load(chkpt_path, map_location=DEVICE)
+            # ckpt["model_state_dict"] contains both base + LoRA weights; strict=False
+            full.load_state_dict(ckpt["model_state_dict"], strict=False)
+            # if you have a saved finexbert checkpoint, load it here:
+            # full.load_state_dict(torch.load("path/to/finexbert.pth", map_location='cpu'))
+            self.bert = full.base_model
 
-        # (4) finally our new span-prediction head
-        self.span_head = SpanExtractionHead(hidden_dim=hidden_dim)
+        else:
+            raise ValueError(f"Unknown backbone {backbone}")
 
-    def forward(
-        self,
-        input_ids,
-        attention_mask,
-        premise_graph_tokens=None,
-        premise_graph_edges=None,
-        premise_node_indices=None,
-        hypothesis_graph_tokens=None,
-        hypothesis_graph_edges=None,
-        hypothesis_node_indices=None,
-    ):
-        # get frozen backbone outputs
-        with torch.no_grad():
-            bert_out = self.gnn_bert.bert(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-            hidden_states = bert_out.last_hidden_state  # [B, T, H]
+        hidden_size = self.bert.config.hidden_size
 
-        # span‐head on top
-        start_logits, end_logits, no_span_logit = self.span_head(hidden_states, attention_mask)
-        return {
-            "start_logits": start_logits,
-            "end_logits":   end_logits,
-            "no_span_logit": no_span_logit,
-        }
+        self.dropout = nn.Dropout(dropout_prob)
+        self.classifier = nn.Linear(hidden_size, 1)
+
+        # initialize bias to log-odds of init_pos_frac
+        if init_pos_frac is not None:
+            b0 = float(math.log(init_pos_frac / (1.0 - init_pos_frac)))
+            self.classifier.bias.data.fill_(b0)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids,
+                             attention_mask=attention_mask)
+        x      = self.dropout(outputs.pooler_output)
+        logits = self.classifier(x).squeeze(-1)   # [batch]
+        return logits

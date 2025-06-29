@@ -5,18 +5,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from nltk import sent_tokenize
+from sklearn.metrics import accuracy_score, precision_score, f1_score
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
 from transformers import AutoTokenizer, AutoModel, AutoConfig, get_linear_schedule_with_warmup
 from peft import PeftModel, LoraConfig, get_peft_model
 from datasets import load_dataset, DatasetDict, load_from_disk
 import spacy
 import re
-import networkx as nx
 from tqdm.auto import tqdm
 from accelerate import Accelerator
 import matplotlib.pyplot as plt
+from torch.optim import AdamW
+import pandas as pd
+from typing import Optional, Tuple, List, Dict
 
-from models import GraphAugmentedNLIModel, GraphAugmentedFinNLIModel, FrozenGNNBertSpanModel
+from models import GraphAugmentedNLIModel, GraphAugmentedFinNLIModel
 from preprocess_data import SpanExtractionChunkedDataset, process_data, chunk_transcript, span_collate_fn
 
 # =============================
@@ -381,211 +386,6 @@ def predict_fin_nli(
     return label, scores
 
 
-def train_span_extraction(
-    train_data,
-    val_data,
-    tokenizer=tokenizer,
-    epochs=15,
-    batch_size=5,
-    lr=5e-4,
-    base_model_name="bert-base-uncased",
-    device="cuda",
-    save_model=False,
-    save_path='span_extraction_model.pt',
-    freeze=True,
-    lora_enabled=True,
-    show_graph=False,
-    few_shot=False,
-    k_shot=2
-):
-    # Build datasets
-    if few_shot:
-        few = create_few_shot_data(train_data, k=k_shot)
-        train_dataset = SpanExtractionChunkedDataset(few)
-        val_dataset   = SpanExtractionChunkedDataset(val_data)
-    else:
-        train_dataset = SpanExtractionChunkedDataset(train_data)
-        val_dataset   = SpanExtractionChunkedDataset(val_data)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  collate_fn=span_collate_fn)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, collate_fn=span_collate_fn)
-
-    do_validation = len(val_dataset) > 0
-
-    # Model & optimizer
-    model = FrozenGNNBertSpanModel(
-        base_model_name=base_model_name,
-        freeze=freeze,
-        lora_enabled=lora_enabled
-    ).to(device)
-    optimizer = torch.optim.AdamW(model.span_head.parameters(), lr=lr)
-    ce_loss   = nn.CrossEntropyLoss()
-    bce_loss  = nn.BCEWithLogitsLoss()
-
-    epoch_loss_train = []
-    epoch_loss_val   = []
-    best_val_loss    = float('inf')
-    best_epoch       = -1
-
-    for epoch in range(1, epochs+1):
-        # — train —
-        model.train()
-        train_losses = []
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} — Training"):
-            optimizer.zero_grad()
-
-            input_ids      = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            start_pos      = batch["start_positions"].to(device)
-            end_pos        = batch["end_positions"].to(device)
-            no_span_label  = batch["no_span_label"].float().to(device)
-
-            out = model(input_ids=input_ids, attention_mask=attention_mask)
-            start_logits, end_logits, no_span_logit = out["start_logits"], out["end_logits"], out["no_span_logit"]
-
-            # only compute span losses where no_span==0
-            valid = (start_pos >= 0) & (end_pos >= 0) & (no_span_label == 0)
-            if valid.any():
-                loss_start = ce_loss(start_logits[valid], start_pos[valid])
-                loss_end   = ce_loss(end_logits[valid],   end_pos[valid])
-            else:
-                loss_start = torch.tensor(0.0, device=device)
-                loss_end   = torch.tensor(0.0, device=device)
-
-            loss_nospan = bce_loss(no_span_logit, no_span_label)
-            loss = loss_start + loss_end + loss_nospan
-
-            loss.backward()
-            optimizer.step()
-            train_losses.append(loss.item())
-
-        avg_train = float(np.mean(train_losses))
-        epoch_loss_train.append(avg_train)
-        print(f"Epoch {epoch} — Train Loss: {avg_train:.4f}")
-
-        # — validate —
-        if do_validation:
-            model.eval()
-            val_losses = []
-            with torch.no_grad():
-                for batch in val_loader:
-                    input_ids      = batch["input_ids"].to(device)
-                    attention_mask = batch["attention_mask"].to(device)
-                    start_pos      = batch["start_positions"].to(device)
-                    end_pos        = batch["end_positions"].to(device)
-                    no_span_label  = batch["no_span_label"].float().to(device)
-
-                    out = model(input_ids=input_ids, attention_mask=attention_mask)
-                    start_logits, end_logits, no_span_logit = out["start_logits"], out["end_logits"], out["no_span_logit"]
-
-                    valid = (start_pos >= 0) & (end_pos >= 0) & (no_span_label == 0)
-                    if valid.any():
-                        loss_start = ce_loss(start_logits[valid], start_pos[valid])
-                        loss_end   = ce_loss(end_logits[valid],   end_pos[valid])
-                    else:
-                        loss_start = torch.tensor(0.0, device=device)
-                        loss_end   = torch.tensor(0.0, device=device)
-                    loss_nospan = bce_loss(no_span_logit, no_span_label)
-
-                    val_losses.append((loss_start + loss_end + loss_nospan).item())
-
-            avg_val = float(np.mean(val_losses)) if val_losses else float('inf')
-            epoch_loss_val.append(avg_val)
-            print(f"Epoch {epoch} — Val   Loss: {avg_val:.4f}")
-
-            if avg_val < best_val_loss:
-                best_val_loss = avg_val
-                best_epoch    = epoch
-                if save_model:
-                    torch.save(model.state_dict(), save_path)
-        else:
-            print(f"Epoch {epoch} — no validation data, skipping.")
-
-    print(f"\nTraining complete. Best val loss {best_val_loss:.4f} at epoch {best_epoch}.")
-
-    if show_graph and do_validation:
-        plt.plot(epoch_loss_train, label="Train Loss", marker='o')
-        plt.plot(epoch_loss_val,   label="Val   Loss", marker='o')
-        plt.title("Span‐Extraction Loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-        plt.savefig("span_extraction_loss.png")
-
-    return model
-
-
-def create_few_shot_data(full_data, k=5, random_seed=42):
-    random.seed(random_seed)
-    if len(full_data) <= k:
-        return full_data
-    else:
-        return random.sample(full_data, k)
-
-
-def predict_span_in_transcript(transcript_text, tokenizer=tokenizer, device="cuda", threshold_no_span=0.0, model_path='span_extraction_model.pt', freeze=True, lora_enabled=False, show_logits=False, score_thresh=0.8):
-    """
-    1) Chunks transcript
-    2) For each chunk, run model, pick best start/end if no_span_logit <= threshold_no_span
-    3) Return the best overall span text or None
-    """
-    all_spans = []
-    model = FrozenGNNBertSpanModel(base_model_name=MODEL_NAME, freeze=freeze, lora_enabled=lora_enabled).to(device)
-    model.load_state_dict(torch.load(model_path, weights_only=True))
-    model.eval()
-    chunked = chunk_transcript(transcript_text, -1, -1, tokenizer)  # -1 => no known gold
-    best_score = float("-inf")
-    best_span_text = None
-
-    logits = []
-
-    with torch.no_grad():
-        for chunk_dict in chunked:
-            ids = chunk_dict["input_ids"].unsqueeze(0).to(device)
-            mask = chunk_dict["attention_mask"].unsqueeze(0).to(device)
-            outputs = model(input_ids=ids, attention_mask=mask)
-            start_logits = outputs["start_logits"][0].cpu().numpy()  # [seq_len]
-            start_logits = np.exp(start_logits)/np.sum(np.exp(start_logits))
-            end_logits   = outputs["end_logits"][0].cpu().numpy()
-            end_logits = np.exp(end_logits)/np.sum(np.exp(end_logits))
-            no_span_val  = outputs["no_span_logit"][0].item()
-
-            logits.append(no_span_val)
-
-            if no_span_val > threshold_no_span:
-                # Model indicates no span for this chunk
-                continue
-
-            # find best start
-            best_start_idx = int(np.argmax(start_logits))
-            best_end_idx   = int(np.argmax(end_logits))
-            if best_end_idx < best_start_idx:
-                continue
-
-            score = (start_logits[best_start_idx] + end_logits[best_end_idx])/2
-            if score > best_score:
-                best_score = score
-                # decode
-                local_ids = chunk_dict["input_ids"][best_start_idx : best_end_idx+1]
-                buffer = tokenizer.decode(local_ids, skip_special_tokens=True)
-                #print(buffer)
-                if len(buffer.split()) > 8:
-                    best_span_text = buffer
-
-            if score>=score_thresh:
-                local_ids = chunk_dict["input_ids"][best_start_idx : best_end_idx+1]
-                span_text = tokenizer.decode(local_ids, skip_special_tokens=True)
-                all_spans.append((score, span_text))
-
-    if show_logits:
-        #print('Logits from the model for each chunk: {}'.format(logits))
-        #print(sorted(all_spans, key=lambda x: x[0], reverse=True))
-        return best_span_text, sorted(all_spans, key=lambda x: x[0], reverse=True)
-    return best_span_text
-
-
 def train_model_with_chkpt(epochs: int = 5,
                 batch_size: int = 16,
                 lr: float = 2e-5,
@@ -806,3 +606,362 @@ def extract_sentences_by_intent(
     # 5) sort & trim
     results.sort(key=lambda x: x[1], reverse=True)
     return results[:top_k] if top_k else results
+
+
+def train_sentence_extractor(
+    model: nn.Module,
+    dataset: torch.utils.data.Dataset,
+    output_dir: str,
+    val_split: float = 0.2,
+    epochs: int      = 3,
+    batch_size: int  = 16,
+    lr: float        = 2e-5,
+    device: str      = "cpu",
+    unfreeze_after_epoch: int = 1,
+    threshold: float = 0.5
+):
+    """
+    Fine-tune `model` on `dataset`, hold out `val_split` for val,
+    compute loss + acc + precision + F1 each epoch, save best checkpoint,
+    and plot all four metrics at the end.
+    """
+    # Split
+    total = len(dataset)
+    val_n = int(total * val_split)
+    train_n = total - val_n
+    train_ds, val_ds = random_split(dataset, [train_n, val_n])
+
+    # Oversample train
+    train_labels = [train_ds[i]['label'].item() for i in range(len(train_ds))]
+    counts = torch.bincount(torch.tensor(train_labels, dtype=torch.long))
+    weights = (1.0 / counts.float()).tolist()
+    sample_weights = [weights[int(l)] for l in train_labels]
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+
+    model.to(device)
+    # initially freeze backbone
+    for p in model.bert.parameters(): p.requires_grad = False
+
+    optimizer = AdamW(model.parameters(), lr=lr)
+    total_steps = epochs * len(train_loader)
+    scheduler   = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(0.1 * total_steps),
+        num_training_steps=total_steps
+    )
+    criterion = nn.BCEWithLogitsLoss()
+
+    # storage for metrics
+    train_losses, val_losses = [], []
+    train_accs,  val_accs  = [], []
+    train_precs, val_precs = [], []
+    train_f1s,   val_f1s   = [], []
+
+    best_val_loss = float('inf')
+
+    for epoch in range(1, epochs+1):
+        # —— TRAIN ——
+        model.train()
+        epoch_loss = 0.0
+        preds, labels = [], []
+        for batch in tqdm(train_loader, desc=f"Train {epoch}/{epochs}"):
+            inputs = batch['input_ids'].to(device)
+            masks  = batch['attention_mask'].to(device)
+            labs   = batch['label'].to(device)
+
+            optimizer.zero_grad()
+            logits = model(inputs, masks)              # raw logits
+            loss   = criterion(logits, labs)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss.item()
+
+            probs = torch.sigmoid(logits)
+            batch_preds = (probs >= threshold).long()
+            preds.extend(batch_preds.cpu().tolist())
+            labels.extend(labs.cpu().long().tolist())
+
+        avg_train = epoch_loss / len(train_loader)
+        train_losses.append(avg_train)
+        train_accs.append(  accuracy_score(labels, preds) )
+        train_precs.append( precision_score(labels, preds, zero_division=0) )
+        train_f1s.append(   f1_score(labels, preds, zero_division=0) )
+        print(f"→ Epoch {epoch} Train — loss {avg_train:.4f}, acc {train_accs[-1]:.4f}, prec {train_precs[-1]:.4f}, f1 {train_f1s[-1]:.4f}")
+
+        # unfreeze if needed
+        if epoch == unfreeze_after_epoch:
+            for p in model.bert.parameters(): p.requires_grad = True
+            optimizer = AdamW([
+                {"params": model.classifier.parameters(), "lr": 1e-3},
+                {"params": model.bert.parameters(),       "lr": 1e-5},
+            ], weight_decay=1e-2)
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=int(0.1 * total_steps),
+                num_training_steps=total_steps
+            )
+
+        # —— VALIDATION ——
+        model.eval()
+        epoch_loss = 0.0
+        preds, labels = [], []
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f" Val   {epoch}/{epochs}"):
+                inputs = batch['input_ids'].to(device)
+                masks  = batch['attention_mask'].to(device)
+                labs   = batch['label'].to(device)
+
+                logits = model(inputs, masks)
+                loss   = criterion(logits, labs)
+                epoch_loss += loss.item()
+
+                probs = torch.sigmoid(logits)
+                batch_preds = (probs >= threshold).long()
+                preds.extend(batch_preds.cpu().tolist())
+                labels.extend(labs.cpu().long().tolist())
+
+        avg_val = epoch_loss / len(val_loader)
+        val_losses.append(avg_val)
+        val_accs.append(  accuracy_score(labels, preds) )
+        val_precs.append( precision_score(labels, preds, zero_division=0) )
+        val_f1s.append(   f1_score(labels, preds, zero_division=0) )
+        print(f"→ Epoch {epoch}   Val — loss {avg_val:.4f}, acc {val_accs[-1]:.4f}, prec {val_precs[-1]:.4f}, f1 {val_f1s[-1]:.4f}")
+
+        # checkpoints
+        os.makedirs(output_dir, exist_ok=True)
+        ckpt = os.path.join(output_dir, f"epo{epoch}_val{avg_val:.4f}.pth")
+        torch.save(model.state_dict(), ckpt)
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            torch.save(model.state_dict(), os.path.join(output_dir, "best_model.pth"))
+            print(f"🎉 New best model saved (val loss {best_val_loss:.4f})")
+
+    print(f"✔️ Training complete — best val loss: {best_val_loss:.4f}")
+
+    # —— PLOT METRICS ——
+    epochs = list(range(1, epochs+1))
+
+    save_metric_plot(
+        epochs,
+        train_losses,
+        val_losses,
+        metric_name="Loss",
+        output_path="results/Loss_Plot.png"
+    )
+
+    save_metric_plot(
+        epochs,
+        train_accs,
+        val_accs,
+        metric_name="Accuracy",
+        output_path="results/Accuracy_Plot.png",
+        threshold=0.5
+    )
+
+    save_metric_plot(
+        epochs,
+        train_precs,
+        val_precs,
+        metric_name="Precision",
+        output_path="results/Precision_Plot.png",
+        threshold=0.5
+    )
+
+    save_metric_plot(
+        epochs,
+        train_f1s,
+        val_f1s,
+        metric_name="F1 Score",
+        output_path="results/F1Score_Plot.png",
+        threshold=0.5
+    )
+
+
+def save_metric_plot(
+    epochs,
+    train_vals,
+    val_vals,
+    metric_name: str,
+    output_path: str,
+    threshold: float = None
+):
+    """
+    epochs      – list of epoch indices
+    train_vals  – list of train metric values
+    val_vals    – list of validation metric values
+    metric_name – e.g. "Loss", "Accuracy", "Precision", "F1 Score"
+    output_path – where to save the PNG
+    threshold   – optional horizontal line to draw, e.g. 0.5
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, train_vals, marker='o', linewidth=2, label=f'Train {metric_name}')
+    ax.plot(epochs, val_vals,   marker='s', linewidth=2, label=f'Val {metric_name}')
+
+    if threshold is not None:
+        ax.axhline(threshold, color='gray', linestyle='--', linewidth=1, label=f'Threshold = {threshold}')
+
+    ax.set_title(f'{metric_name} over Epochs', fontsize=14, pad=10)
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel(metric_name, fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.4)
+    ax.legend(loc='best', frameon=True, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+def demo_on_random_val(
+    model,
+    tokenizer,
+    excel_path: str,
+    ckpt_path: str,
+    max_length: int = 128,
+    device: str    = "cpu",
+    temperature: float = 1.0
+):
+    """
+    Like demo_on_random_val, but instead of a fixed threshold:
+      1) Compute sigmoid(logits / temperature) for each sentence
+      2) Sort probabilities descending
+      3) Find the largest gap between adjacent probs
+      4) Set dynamic_threshold = midpoint of that gap
+      5) Extract all sentences with prob >= dynamic_threshold
+    """
+    # load model
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.to(device).eval()
+
+    # sample one from validation split
+    df = pd.read_excel(excel_path)
+    _, val_df = train_test_split(df, test_size=0.2, random_state=42)
+    row = val_df.sample(n=1, random_state=random.randint(0,999)).iloc[0]
+    transcript = str(row['Claude_Call'])
+    print(f"\n── Transcript (val sample idx={row['idx']}):\n{transcript}\n")
+
+    # split into sentences & run inference
+    sentences, probs = [], []
+    for sent in sent_tokenize(transcript):
+        enc = tokenizer.encode_plus(
+            sent,
+            max_length=max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        logits = model(enc['input_ids'].to(device),
+                       enc['attention_mask'].to(device))
+        prob   = torch.sigmoid(logits / temperature).item()
+        sentences.append(sent)
+        probs.append(prob)
+
+    # print all
+    print("Sentence probabilities:")
+    for s,p in zip(sentences, probs):
+        print(f"  → {p:.4f} → {s}")
+
+    # if no variation, fall back to 0.5
+    if len(probs) < 2 or max(probs) - min(probs) < 1e-3:
+        dynamic_thr = 0.5
+    else:
+        # find elbow in sorted probabilities
+        sorted_probs = sorted(probs, reverse=True)
+        diffs = [sorted_probs[i] - sorted_probs[i+1] for i in range(len(sorted_probs)-1)]
+        idx = max(range(len(diffs)), key=lambda i: diffs[i])
+        # threshold is midpoint between the two
+        dynamic_thr = (sorted_probs[idx] + sorted_probs[idx+1]) / 2.0
+
+    print(f"\nDynamic threshold = {dynamic_thr:.4f}\n")
+    print("Extracted sentences:")
+    for s,p in zip(sentences, probs):
+        if p >= dynamic_thr:
+            print(f"  • {p:.4f} → {s}")
+    print()
+
+
+def batch_predict_and_save(
+    model,
+    tokenizer,
+    excel_path: str,
+    ckpt_path: str,
+    output_path: str,
+    n_samples: int     = 40,
+    max_length: int    = 128,
+    device: str        = "cpu",
+    temperature: float = 1.0,
+    random_state: int  = None
+):
+    """
+    1) Loads best checkpoint
+    2) Samples `n_samples` rows
+    3) For each transcript:
+         - tokenize into sentences
+         - compute p = sigmoid(logits/temperature)
+         - compute elbow threshold on sorted p’s
+         - extract all sentences with p >= elbow
+         - if none, pick the highest-p sentence
+    4) Save new Excel with columns:
+         - 'Claude_Call'
+         - 'Predicted Sel_K' (list of extracted sentences)
+    """
+    # load model
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.to(device).eval()
+
+    # sample rows
+    df = pd.read_excel(excel_path)
+    sampled = df.sample(n=n_samples, random_state=random_state) \
+               if random_state is not None else df.sample(n=n_samples)
+
+    records = []
+    for _, row in tqdm(sampled.iterrows(),
+                       total=len(sampled),
+                       desc="Running Predictions"):
+        transcript = str(row['Claude_Call'])
+        sentences  = sent_tokenize(transcript)
+
+        # compute probabilities
+        probs = []
+        for sent in sentences:
+            enc = tokenizer.encode_plus(
+                sent,
+                max_length=max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            with torch.no_grad():
+                logits = model(enc['input_ids'].to(device),
+                               enc['attention_mask'].to(device))
+                p = torch.sigmoid(logits / temperature).item()
+            probs.append(p)
+
+        # dynamic threshold via elbow detection
+        if len(probs) >= 2 and max(probs) - min(probs) > 1e-3:
+            sp = sorted(probs, reverse=True)
+            diffs = [sp[i] - sp[i+1] for i in range(len(sp)-1)]
+            idx  = max(range(len(diffs)), key=lambda i: diffs[i])
+            thr  = (sp[idx] + sp[idx+1]) / 2.0
+        else:
+            thr = 0.5  # fallback
+
+        # collect all above threshold, else top-1
+        extracted = [s for s,p in zip(sentences, probs) if p >= thr]
+        if not extracted and sentences:
+            best_idx = int(max(range(len(probs)), key=lambda i: probs[i]))
+            extracted = [sentences[best_idx]]
+
+        records.append({
+            'Claude_Call':     transcript,
+            'Predicted Sel_K': extracted
+        })
+
+    # save
+    out_df = pd.DataFrame(records)
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    out_df.to_excel(output_path, index=False)
+    print(f"➡️ Saved {len(out_df)} rows to {output_path}")

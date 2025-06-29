@@ -3,6 +3,8 @@ import logging
 import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset, load_from_disk
+import pandas as pd
+import nltk
 
 from config import MODEL_NAME, MAX_LENGTH, OVERLAP, PREPROCESSED_DIR, tokenizer, nlp
 
@@ -163,3 +165,46 @@ def span_collate_fn(batch):
         "end_positions": torch.tensor(ends, dtype=torch.long),
         "no_span_label": torch.tensor(nos, dtype=torch.long),
     }
+
+
+nltk.download('punkt')
+nltk.download('punkt_tab')
+
+class SentenceDataset(Dataset):
+    def __init__(self,
+                 excel_path: str,
+                 tokenizer,
+                 max_length: int = 128):
+        df = pd.read_excel(excel_path)
+        self.samples = []
+
+        for _, row in df.iterrows():
+            transcript     = str(row['Claude_Call'])
+            gold_sentences = row['Sel_K']
+            # if it's a string repr of list, eval it
+            if isinstance(gold_sentences, str):
+                gold_sentences = eval(gold_sentences)
+
+            # split into sentences
+            sentences = nltk.sent_tokenize(transcript)
+            for sent in sentences:
+                label = 1 if sent in gold_sentences else 0
+
+                enc = tokenizer.encode_plus(
+                    sent,
+                    max_length=max_length,
+                    padding='max_length',
+                    truncation=True,
+                    return_tensors='pt'
+                )
+                self.samples.append({
+                    'input_ids':      enc['input_ids'].squeeze(0),
+                    'attention_mask': enc['attention_mask'].squeeze(0),
+                    'label':          torch.tensor(label, dtype=torch.float)
+                })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]

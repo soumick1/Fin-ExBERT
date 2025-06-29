@@ -1,8 +1,12 @@
 #from models import *
 #from preprocess_data import *
-from utils import *
+from utils import extract_sentences_by_intent, train_model_with_chkpt, batch_predict_and_save
 from time import time
 import logging
+from config import *
+
+
+
 
 
 if __name__ == '__main__':
@@ -10,6 +14,62 @@ if __name__ == '__main__':
     #             save_model=True,
     #             save_path='gnn_model_checkpoint.pt',
     #             resume=True)
+
+    from transformers import BertTokenizer
+    from preprocess_data import SentenceDataset
+    from models import SentenceExtractionModel
+    from utils import train_sentence_extractor
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    dataset = SentenceDataset("data/Fin_ExBERT_train_val_data.xlsx", tokenizer)
+
+
+    model = SentenceExtractionModel(
+        base_model_name=MODEL_NAME,
+        backbone='finexbert'
+    )
+
+    # train_sentence_extractor(
+    #     model,
+    #     dataset,
+    #     output_dir="checkpoints/sentence_extractor",
+    #     val_split=0.3,
+    #     epochs=10,
+    #     batch_size=16,
+    #     lr=3e-4,
+    #     device=DEVICE,
+    #     unfreeze_after_epoch=4
+    # )
+    #
+    # from transformers import BertTokenizer
+    # from models import SentenceExtractionModel
+    # from utils import demo_on_random_val
+    #
+    # tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    # model = SentenceExtractionModel(
+    #     base_model_name=MODEL_NAME,
+    #     backbone='finexbert'
+    # )
+    #
+    # demo_on_random_val(
+    #     model,
+    #     tokenizer,
+    #     excel_path="data/Fin_ExBERT_test_set.xlsx",
+    #     ckpt_path="checkpoints/sentence_extractor/best_model.pth",
+    #     device="cuda",  # or "cpu"
+    #     temperature=1,
+    # )
+
+    batch_predict_and_save(
+        model,
+        tokenizer,
+        excel_path="data/Fin_ExBERT_test_set.xlsx",
+        ckpt_path="checkpoints/sentence_extractor/best_model.pth",
+        output_path="results/predictions_sample200.xlsx",
+        n_samples=200,
+        temperature=1.0,
+        device="cuda"
+    )
 
     sample_transcript = """
     Agent: Hello, thank you for calling Acme Financial Services. My name is Priya. How can I help you today?
@@ -50,19 +110,23 @@ if __name__ == '__main__':
     # print("Prediction:", prediction)
     # print('Final layer logits:', _)
 
-    start = time()
-    results = extract_sentences_by_intent(
-        complex_transcript,
-        intent="customer tells about own financial condition",#"customer states specific financial product requests and planning preferences",
-        #"agent provides assistance", #"customer states their financial needs",
-        threshold=0.60,
-        top_k=10,
-        convo_focus='customer'
-    )
-    end = time()
+    ################################
 
-    logging.info('Prediction Done in {:.2f}sec'.format(end - start))
+    # start = time()
+    # results = extract_sentences_by_intent(
+    #     complex_transcript,
+    #     intent="customer tells about own financial condition",#"customer states specific financial product requests and planning preferences",
+    #     #"agent provides assistance", #"customer states their financial needs",
+    #     threshold=0.60,
+    #     top_k=10,
+    #     convo_focus='customer'
+    # )
+    # end = time()
+    #
+    # logging.info('Prediction Done in {:.2f}sec'.format(end - start))
+    #
+    # for sentence, score in results:
+    #     print(f"{score:.2f} → {sentence}")
 
-    for sentence, score in results:
-        print(f"{score:.2f} → {sentence}")
+
 

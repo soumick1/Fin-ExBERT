@@ -26,6 +26,21 @@ def flatten_to_text(x):
         return "\n".join(flatten_to_text(v) for v in x)
     return str(x)
 
+def label_to_int(lbl: str) -> int:
+    # handles both variants A and B
+    m = re.search(r"([1-5])", lbl)
+    if m:                       # digits present -> easy
+        return int(m.group(1))
+    # descriptive version -> map by order
+    mapping = {
+        "very bad answer": 1,
+        "bad answer": 2,
+        "acceptable answer": 3,
+        "good answer": 4,
+        "perfect answer": 5
+    }
+    return mapping.get(lbl.lower(), 1)
+
 # ─── 1) choose these two datasets ──────────────────────────────────────────────
 datasets_info = [
     ("FinQA-10K", "virattt/financial-qa-10K", "train", False, {}),
@@ -33,7 +48,13 @@ datasets_info = [
 ]
 
 # ─── 2) spin up zero‐shot classification judges ────────────────────────────────
-candidate_labels = ["1","2","3","4","5"]
+candidate_labels = [
+    "very bad answer",   # 1
+    "bad answer",        # 2
+    "acceptable answer", # 3
+    "good answer",       # 4
+    "perfect answer"     # 5
+]
 
 judge1 = pipeline(
     "zero-shot-classification",
