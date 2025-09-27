@@ -9,21 +9,6 @@
 
 **Accepted at EMNLP 2025 Industry Track**
 
-## Table of Contents
-
-- [Overview](#overview)
-- [Key Features](#key-features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Model Architecture](#model-architecture)
-- [Training](#training)
-- [Evaluation](#evaluation)
-- [API Reference](#api-reference)
-- [Examples](#examples)
-- [Citation](#citation)
-- [Contributing](#contributing)
-- [License](#license)
-
 ## Overview
 
 FinExBERT combines BERT's contextual understanding with graph neural networks to capture syntactic dependencies in financial conversations. The model achieves superior performance in extracting relevant sentences based on user intent, making it particularly effective for financial customer service applications.
