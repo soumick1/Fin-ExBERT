@@ -127,7 +127,7 @@ train_sentence_extractor(
 
 ## Model Architecture
 
-![FinExBERT Architecture](images/methodology_flowchart (2).png)
+![FinExBERT Architecture](images/methodology_flowchart.png)
 
 ### Core Components
 
@@ -142,7 +142,6 @@ train_sentence_extractor(
 - **Base Model**: BERT-base-uncased (110M parameters)
 - **GNN Architecture**: Simple message passing with attention
 - **Training Strategy**: LoRA adaptation + full fine-tuning
-- **Optimization**: AdamW with linear warmup and decay
 
 
 ## Evaluation
@@ -172,33 +171,9 @@ We provide comprehensive ablation studies comparing:
 If you use FinExBERT in your research, please cite:
 
 ```bibtex
-@inproceedings{finexbert2024,
-  title={FinExBERT: Financial Sentence Extraction with Graph-Augmented BERT},
-  author={Your Name and Co-authors},
-  booktitle={Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing: Industry Track},
-  year={2024},
-  publisher={Association for Computational Linguistics}
-}
+Will post it soon
 ```
 
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
-
-### Development Setup
-
-```bash
-git clone https://github.com/yourusername/finexbert.git
-cd finexbert
-pip install -e ".[dev]"
-pre-commit install
-```
-
-### Running Tests
-
-```bash
-pytest tests/
-```
 
 ## License
 
@@ -212,9 +187,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- 📧 Email: your.email@example.com
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/finexbert/issues)
-- 💬 Discussions: [GitHub Discussions](https://github.com/yourusername/finexbert/discussions)
+- 📧 Email: soumicksarker9@gmail.com
 
 ---
 
