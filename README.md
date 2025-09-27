@@ -127,7 +127,7 @@ train_sentence_extractor(
 
 ## Model Architecture
 
-![FinExBERT Architecture](docs/images/architecture.png)
+![FinExBERT Architecture](images/methodology_flowchart (2).png)
 
 ### Core Components
 
