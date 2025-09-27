@@ -62,70 +62,82 @@ FinExBERT addresses these challenges through:
 - CUDA 11.0+ (for GPU acceleration)
 
 
-### Install from Source
+### Install dependencies
 
 ```bash
 git clone https://github.com/soumick1/Fin-ExBERT.git
-cd finexbert
-pip install -e .
-```
-
-### Development Installation
-
-```bash
-git clone https://github.com/yourusername/finexbert.git
-cd finexbert
-pip install -e ".[dev]"
+pip install -r requirements.txt
 ```
 
 ## Quick Start
 
 ### Download the model weights
 
+Download the weights from the [Weights Link](https://drive.google.com/drive/folders/1jm3Yxpew8Y8mVsRizTyVvXKrGBXQ3ApI?usp=sharing)
+And put the 3 folders inside the cloned directory.
 
+### Data setup
 
-### Basic Usage
+The CreditCall12H Dataset is available in the 'data' folder. If you want to train or test on your own data please use the same format.
+
+### Basic Usage and Testing
 
 ```python
-from finexbert import FinExBERTPredictor
+from utils import batch_predict_and_save
+from config import *
+from preprocess_data import SentenceDataset
+from models import SentenceExtractionModel
 
 # Initialize the model
-predictor = FinExBERTPredictor.from_pretrained("finexbert-base")
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")  ### You can change the tokenizer if you want 
+dataset = SentenceDataset("data/Fin_ExBERT_train_val_data.xlsx", tokenizer)
 
-# Extract relevant sentences
-transcript = """
-Customer: I'm interested in opening a savings account.
-Agent: Great! Our current rate is 2.5% APY.
-Customer: What's the minimum balance required?
-Agent: The minimum balance is $500.
-"""
-
-intent = "customer asks about account requirements"
-relevant_sentences = predictor.extract_sentences(transcript, intent)
-
-for sentence, score in relevant_sentences:
-    print(f"Score: {score:.3f} | {sentence}")
-```
-
-### Advanced Configuration
-
-```python
-from finexbert import FinExBERTConfig, FinExBERTPredictor
-
-# Custom configuration
-config = FinExBERTConfig(
-    model=ModelConfig(
-        model_name="bert-large-uncased",
-        gnn_dim=256,
-        dropout_prob=0.2
-    ),
-    training=TrainingConfig(
-        batch_size=32,
-        learning_rate=1e-5
-    )
+model = SentenceExtractionModel(
+    base_model_name=MODEL_NAME,
+    backbone='finexbert'
 )
 
-predictor = FinExBERTPredictor(config=config)
+# Extract relevant sentences
+batch_predict_and_save(
+    model,
+    tokenizer,
+    excel_path="data/Fin_ExBERT_test_set.xlsx",
+    ckpt_path="checkpoints/sentence_extractor/best_model.pth",
+    output_path="results/predictions_sample200.xlsx",
+    n_samples=200,
+    temperature=1.0,
+    device="cuda"
+)
+```
+
+### Training the model
+
+```python
+from utils import train_model_with_chkpt
+from config import *
+from preprocess_data import SentenceDataset
+from models import SentenceExtractionModel
+
+# Initialize the model
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")  ### You can change the tokenizer if you want 
+dataset = SentenceDataset("data/Fin_ExBERT_train_val_data.xlsx", tokenizer)
+
+model = SentenceExtractionModel(
+    base_model_name=MODEL_NAME,
+    backbone='finexbert'
+)
+
+train_sentence_extractor(
+    model,
+    dataset,
+    output_dir="checkpoints/sentence_extractor",
+    val_split=0.3,
+    epochs=10,
+    batch_size=16,
+    lr=3e-4,
+    device=DEVICE,
+    unfreeze_after_epoch=4
+)
 ```
 
 ## Model Architecture
@@ -147,35 +159,6 @@ predictor = FinExBERTPredictor(config=config)
 - **Training Strategy**: LoRA adaptation + full fine-tuning
 - **Optimization**: AdamW with linear warmup and decay
 
-## Training
-
-### Prepare Your Data
-
-```python
-from finexbert.data import SentenceDataset
-
-# Format: Excel file with columns 'Claude_Call' and 'Sel_K'
-dataset = SentenceDataset("your_data.xlsx")
-```
-
-### Train the Model
-
-```python
-from finexbert import FinExBERTTrainer
-
-trainer = FinExBERTTrainer(
-    model=model,
-    config=config,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset
-)
-
-trainer.train()
-```
-
-### Custom Training Script
-
-See `examples/train_model.py` for a complete training example.
 
 ## Evaluation
 
@@ -188,15 +171,6 @@ We provide comprehensive ablation studies comparing:
 - Various training strategies
 - Domain adaptation techniques
 
-```python
-from finexbert.evaluation import run_ablation_study
-
-results = run_ablation_study(
-    models=["bert-baseline", "finexbert"],
-    dataset="financial-conversations",
-    metrics=["accuracy", "f1", "precision", "recall"]
-)
-```
 
 ### Performance Metrics
 
@@ -206,81 +180,7 @@ results = run_ablation_study(
 | FinExBERT | 0.694 | 0.418 | 0.456 | 0.391 |
 | **Improvement** | **+37%** | **+26%** | **+31%** | **+20%** |
 
-## API Reference
 
-### Core Classes
-
-#### `FinExBERTPredictor`
-
-Main inference class for sentence extraction.
-
-```python
-class FinExBERTPredictor:
-    def __init__(self, model_path: str, config: FinExBERTConfig = None)
-    def extract_sentences(self, text: str, intent: str, **kwargs) -> List[Tuple[str, float]]
-    def batch_extract(self, texts: List[str], intents: List[str]) -> List[List[Tuple[str, float]]]
-    @classmethod
-    def from_pretrained(cls, model_name: str) -> 'FinExBERTPredictor'
-```
-
-#### `FinExBERTTrainer`
-
-Training utilities for model fine-tuning.
-
-```python
-class FinExBERTTrainer:
-    def __init__(self, model, config, train_dataset, eval_dataset)
-    def train(self) -> Dict[str, float]
-    def evaluate(self) -> Dict[str, float]
-    def save_model(self, path: str)
-```
-
-### Configuration
-
-All model and training parameters are configurable through the `FinExBERTConfig` class.
-
-## Examples
-
-### 1. Financial Intent Extraction
-
-```python
-# Extract sentences related to specific financial topics
-predictor = FinExBERTPredictor.from_pretrained("finexbert-base")
-
-transcript = load_conversation("customer_call.txt")
-intents = [
-    "customer asks about loan rates",
-    "agent explains fees",
-    "customer requests account information"
-]
-
-for intent in intents:
-    sentences = predictor.extract_sentences(transcript, intent, top_k=3)
-    print(f"\n{intent}:")
-    for sentence, score in sentences:
-        print(f"  {score:.3f}: {sentence}")
-```
-
-### 2. Batch Processing
-
-```python
-# Process multiple conversations efficiently
-conversations = load_conversations("data/conversations.jsonl")
-intents = ["customer complaint", "product inquiry", "account issue"]
-
-results = predictor.batch_extract(
-    texts=[conv["transcript"] for conv in conversations],
-    intents=intents * len(conversations)
-)
-```
-
-### 3. Custom Model Training
-
-See `examples/` directory for complete training scripts:
-
-- `train_model.py`: Full model training pipeline
-- `evaluate_model.py`: Comprehensive evaluation
-- `ablation_study.py`: Ablation study reproduction
 
 ## Citation
 
