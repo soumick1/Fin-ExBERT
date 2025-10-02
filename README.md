@@ -3,7 +3,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![arXiv](https://img.shields.io/badge/arXiv-2025.23259-b31b1b.svg)](https://arxiv.org/)
+[![arXiv](https://img.shields.io/badge/arXiv-2509.23259-b31b1b.svg)]([https://arxiv.org/](https://www.arxiv.org/abs/2509.23259))
 
 > A state-of-the-art neural architecture for extracting relevant sentences from financial conversations using graph-augmented BERT with dependency parsing.
 
