@@ -171,10 +171,11 @@ We provide comprehensive ablation studies comparing:
 If you use FinExBERT in your research, please cite:
 
 ```bibtex
-@article{sarker2025fin,
+@inproceedings{sarker2025fin,
   title={Fin-ExBERT: User Intent based Text Extraction in Financial Context using Graph-Augmented BERT and trainable Plugin},
   author={Sarker, Soumick and Rai, Abhijit Kumar},
-  journal={arXiv preprint arXiv:2509.23259},
+  booktitle={Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing: Industry Track},
+  pages={1402--1411},
   year={2025}
 }
 ```
